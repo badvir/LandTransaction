@@ -1,9 +1,11 @@
+import argparse
 import os
 import json
 import time
 import requests
 import pandas as pd
 from tabulate import tabulate
+from datetime import datetime, timedelta
 
 proxies = {
     "http": "http://nwproxy.ahnlab.co.kr:3128",
@@ -16,9 +18,12 @@ PERMISSION_LIST_FILE = "permission_list.csv"
 PERMISSION_LIST_DEDUP_FILE = "permission_list_dedup.csv"
 
 # 서울시 자치구 코드 상수
-SEOCHO_GU = "11650"  # 서초구
-GANGNAM_GU = "11680"  # 강남구
-SONGPA_GU = "11710"   # 송파구
+GU_CODES = {
+    "서초구": "11650",
+    "강남구": "11680",
+    "송파구": "11710",
+    "용산구": "11170",
+}
 
 # 주요 컬럼 한글 이름 설정
 COLUMN_RENAME = {
@@ -29,6 +34,11 @@ COLUMN_RENAME = {
     "APT_NAME": "아파트명",
     "ACC_NO": "일련번호"
 }
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # 여유 있게 4000자로 설정
+TELEGRAM_BOT_TOKEN = "7941733787:AAGyEWUntRhPvBXwJ7DVWUwhluWHrrQNlqI"
+TELEGRAM_CHAT_ID = "6933129780"
+
 
 # 주소 데이터 불러오기
 def load_address_data():
@@ -191,67 +201,159 @@ def show_apartment_summary(df, building_name: str):
 
 
 def show_apt_by_dong(df, dong_name: str):
+    output_lines = []
+
     # 해당 동 필터링
     filtered_df = df[df["DONG_NAME"] == dong_name]
 
     if filtered_df.empty:
-        print(f"❌ 해당 동의 데이터가 없습니다: {dong_name}")
-        return
+        msg = f"❌ 해당 동의 데이터가 없습니다: {dong_name}"
+        output_lines.append(msg)
+        return "\n".join(output_lines)
 
-        # 동 내 건물명 추출
+    # 동 내 건물명 추출
     building_names = filtered_df["APT_NAME"].unique()
 
-    print(f"\n🏘️ '{dong_name}' 내 아파트 정보 (총 {len(building_names)}개 건물)\n")
+
+    header = f"\n🏘️ '{dong_name}' 내 아파트 정보 (총 {len(building_names)}개 건물)\n"
+    output_lines.append(header)
 
     for building_name in building_names:
         result = filtered_df[filtered_df["APT_NAME"] == building_name]
-
         if result.empty:
             continue
 
         result = result[list(COLUMN_RENAME.keys())].rename(columns=COLUMN_RENAME)
 
-        print(f"\n🏢 {building_name}")
-        print(tabulate(result, headers='keys', tablefmt='simple', showindex=False))
+        building_header = f"\n🏢 {building_name}"
+        table_text = tabulate(result, headers='keys', tablefmt='simple', showindex=False)
+
+        output_lines.append(building_header)
+        output_lines.append(table_text)
+
+    return "\n".join(output_lines)
 
 
 def summary_dong(df):
+    output_lines = []
     summary = df.groupby(["DONG_NAME"]).size().reset_index(name="COUNT")
     summary = summary.sort_values(by="COUNT", ascending=False).reset_index(drop=True)  # ← 정렬 추가
-    print("\n📊 동별 상세 통계:")
-    print(summary)
+    msg = f"\n📊 동별 상세 통계:"
+    output_lines.append(msg)
+
+    # plain text로 변환
+    plain_text = summary.to_string(index=False)
+    output_lines.append(plain_text)
+    return "\n".join(output_lines)
 
 
 def summary_apt(df):
+    output_lines = []
     summary = df.groupby(["DONG_NAME", "APT_NAME"]).size().reset_index(name="COUNT")
     summary = summary.sort_values(by="COUNT", ascending=False).reset_index(drop=True)  # ← 정렬 추가
-    print("\n📊 동별 아파트 상세 통계:")
-    print(summary)
+    msg = f"\n📊 아파트 상세 통계:"
+    output_lines.append(msg)
+
+    # plain text로 변환
+    plain_text = summary.to_string(index=False)
+    output_lines.append(plain_text)
+    return "\n".join(output_lines)
 
 
+def send_telegram_message(header, text):
+    full_message = header + text
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-# 실행
-if __name__ == "__main__":
-    # 출력 설정: 행/열 제한 해제
+    for i in range(0, len(full_message), TELEGRAM_MAX_MESSAGE_LENGTH):
+        chunk = full_message[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk
+        }
+        response = requests.post(url, data=data, proxies=proxies)
+
+        if response.status_code != 200:
+            print(f"❌ 메시지 전송 실패: {response.text}")
+            return response.json()  # 첫 실패 결과 반환
+
+    return {"ok": True, "description": "All messages sent successfully"}
+
+
+def main():
+    # 명령줄 인자 파싱
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+
+    parser = argparse.ArgumentParser(description="부동산 토지거래허가 검색 범위 지정")
+    parser.add_argument(
+        "--start_date",
+        help="검색 시작일 (예: 20250601). 지정하지 않으면 어제 날짜가 기본값으로 사용됩니다.",
+        default=yesterday
+    )
+    parser.add_argument(
+        "--end_date",
+        help="검색 종료일 (예: 20250625). 지정하지 않으면 어제 날짜가 기본값으로 사용됩니다.",
+        default=yesterday
+    )
+    args = parser.parse_args()
+
     pd.set_option("display.max_rows", None)
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", None)
 
-    df = fetch_land_transaction_permits(SEOCHO_GU, "20250625", "20250626")
-    if df.empty:
-        exit(0)
+    df_list = []
 
-    df.to_csv(PERMISSION_LIST_FILE, index=False, encoding="utf-8-sig")
+    for gu_name, gu_code in GU_CODES.items():
+        print(f"\n==== {gu_name} ({gu_code}) 처리 시작 ====\n")
 
-    df = enrich_with_building_name(df)
-    df = deduplicate_by_acc_no(df)
+        df = fetch_land_transaction_permits(gu_code, args.start_date, args.end_date)
+        if df.empty:
+            print(f"❌ {gu_name} 검색 결과가 없습니다.")
+            continue
 
-    df.to_csv(PERMISSION_LIST_DEDUP_FILE, index=False, encoding="utf-8-sig")
-    print("✅ 중복 제거 후 CSV 저장 완료")
+        df = enrich_with_building_name(df)
+        df = deduplicate_by_acc_no(df)
 
-    print(df.head())
-    summary_dong(df)
-    summary_apt(df)
-    show_apt_by_dong(df, '우면동')
-    show_apt_by_dong(df, '양재동')
+        # 구 이름 컬럼 추가
+        df["GU"] = gu_name
+
+        df_list.append(df)
+
+    if not df_list:
+        telegram_msg_header = (
+            f"📌 서울시 토지거래허가 현황\n"
+            f"📅 검색 기간: {args.start_date} ~ {args.end_date}\n"
+        )
+        send_telegram_message(telegram_msg_header, "❌ 전체 검색 결과가 없습니다.")
+        return
+
+    # 모든 구 데이터 합치기
+    combined_df = pd.concat(df_list, ignore_index=True)
+
+    telegram_msg_header = (
+        f"📌 서울시 토지거래허가 현황 (4개 구 통합)\n"
+        f"📅 검색 기간: {args.start_date} ~ {args.end_date}\n"
+    )
+
+    print(combined_df.head())
+
+    # 동별 통계 (전체 구 합산)
+    res_text = summary_dong(combined_df)
+    print(res_text)
+    send_telegram_message(telegram_msg_header, res_text)
+
+    # 아파트별 통계 (전체 구 합산)
+    res_text = summary_apt(combined_df)
+    print(res_text)
+    send_telegram_message(telegram_msg_header, res_text)
+
+    # 서초구 데이터만 따로 필터링하여 우면동 아파트 정보 전송
+    seocho_df = combined_df[combined_df["GU"] == "서초구"]
+    if not seocho_df.empty:
+        res_text = show_apt_by_dong(seocho_df, '우면동')
+        print(res_text)
+        send_telegram_message(telegram_msg_header, res_text)
+
+
+if __name__ == "__main__":
+    main()
 
